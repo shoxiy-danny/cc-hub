@@ -1,0 +1,12 @@
+{
+  "name": "cc-hub",
+  "version": "1.0.0",
+  "description": "CC Hub - 多 Claude Code 实例通讯中转服务器",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
