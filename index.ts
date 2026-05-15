@@ -218,6 +218,8 @@ interface HubMessage {
   replyMode?: 'ping' | 'notify' | 'async' | 'sync'
   // 广播模式：inform(通知，默认), require_reply(需要确认)
   broadcastMode?: 'inform' | 'require_reply'
+  // 防循环跳数：每经过一次路由 +1，超过 MAX_HOPS 则丢弃
+  hopCount?: number
 }
 
 interface DbMessage {
@@ -241,6 +243,7 @@ const MAX_LOGS = 5000
 const MAX_QUEUE = 1000
 const DEFAULT_LOG_FILE = process.env.CC_HUB_LOG_FILE || 'hub.log'
 const DEFAULT_DB_FILE = process.env.CC_HUB_DB || 'hub.db'
+const MAX_HOPS = 5                // 消息最大跳数，超过则丢弃
 
 // ==================== SQLite 数据库 ====================
 
@@ -360,6 +363,18 @@ function broadcastNewMessage(msg: HubMessage & { dbId: string }) {
   }
 }
 
+function broadcastClientList() {
+  const clientList = Array.from(clients.keys())
+  const msg = JSON.stringify({ type: 'clients_update', clients: clientList })
+  for (const [, client] of clients) {
+    try {
+      client.ws.send(msg)
+    } catch {
+      // ignore
+    }
+  }
+}
+
 // ==================== 状态 ====================
 
 const clients = new Map<string, Client>()
@@ -420,11 +435,24 @@ function routeMessage(senderId: string, msg: HubMessage): void {
 
   if (!to) return
 
-  // 防止自消息循环：检查 senderId 和 to 是否是同一个 WebSocket 连接
-  // 如果是自消息（发给自己的连接），不路由到其他人，但仍发送 ACK
+  // === hopCount 追踪：防止多跳循环 ===
+  msg.hopCount = (msg.hopCount || 0) + 1
+  if (msg.hopCount > MAX_HOPS) {
+    console.log(`[hub] 丢弃超跳消息: hopCount=${msg.hopCount}, from=${from || senderId}, to=${to}, content=${content?.slice(0, 50)}`)
+    sendToClient(senderId, { type: 'ack', id, from: 'hub', status: 'error', content: 'hop_limit_exceeded' })
+    return
+  }
+
+  // 自消息检测：禁止发给自己
   const senderClient = clients.get(senderId)
-  const targetClient = to === 'all' || to === 'broadcast' ? null : clients.get(to)
-  const isSelfMessage = targetClient && senderClient && senderClient.ws === targetClient.ws
+  if (to !== 'all' && to !== 'broadcast') {
+    const targetClient = clients.get(to)
+    if (targetClient && senderClient && senderClient.ws === targetClient.ws) {
+      console.log(`[hub] 丢弃自消息: ${senderId} -> ${to}`)
+      sendToClient(senderId, { type: 'ack', id, from: to, status: 'error', content: 'self_message_dropped' })
+      return
+    }
+  }
 
   // 生成唯一 ID 并存储到数据库
   const dbId = id || randomUUID()
@@ -620,6 +648,7 @@ const server = Bun.serve({
         clients.set(msg.id, newClient)
         console.log(`[hub] 注册: ${msg.id} (ws ${ws.id}), 当前在线: ${clients.size}`)
         ws.send(JSON.stringify({ type: 'ack', id: msg.id, from: 'hub', status: 'received' }))
+        broadcastClientList()
         return
       }
 
@@ -649,8 +678,20 @@ const server = Bun.serve({
           return
         }
         const text = msg.text as string
-        // 超过50字用本地音频，不调API（MMX计费：1汉字=2字符，1汉字≈2个length）
-        if (text.length > 50) {
+        // 游戏来源：随机播一条本地音频，不调API
+        if (msg.source === 'game') {
+          const idx = Math.floor(Math.random() * 5) + 1
+          const audioFile = join(AUDIO_DIR, `${cc}-game-${idx}.txt`)
+          if (existsSync(audioFile)) {
+            const audioHex = readFileSync(audioFile, 'utf8')
+            ws.send(JSON.stringify({ type: 'tts_audio', audio: audioHex, cc }))
+            ws.send(JSON.stringify({ type: 'tts_done', cc }))
+            console.log(`[hub] TTS game: cc=${cc}, using game audio (no API call)`)
+          } else {
+            console.log(`[hub] TTS game: file not found for ${cc}`)
+          }
+        } else if (text.length > 50) {
+          // Viewer等超过50字用本地音频
           const audioFile = join(AUDIO_DIR, `${cc}.txt`)
           if (existsSync(audioFile)) {
             const audioHex = readFileSync(audioFile, 'utf8')
@@ -686,6 +727,13 @@ const server = Bun.serve({
         }
       }
 
+      // 限速检查
+      const rateResult = checkRateLimit(clientInfo, msg.type || 'message')
+      if (!rateResult.allowed) {
+        console.log(`[hub] ${clientId} 被限速: ${rateResult.reason}`)
+        return
+      }
+
       // 路由消息
       routeMessage(clientId, msg)
     },
@@ -695,6 +743,7 @@ const server = Bun.serve({
       if (client) {
         console.log(`[hub] 断开: ${client[0]}, 剩余: ${clients.size - 1}`)
         clients.delete(client[0])
+        broadcastClientList()
       }
     }
   }

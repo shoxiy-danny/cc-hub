@@ -19,6 +19,7 @@ interface Message {
   timestamp?: number
   replyMode?: 'none' | 'confirm' | 'result' | 'critical'
   broadcastMode?: 'inform' | 'require_reply'
+  hopCount?: number
 }
 
 interface Ack {
@@ -145,9 +146,12 @@ export class HubClient {
         }
       }
     } else if (msg.type === 'message' || msg.type === 'new_message') {
+      // 存储跳数，供回复时透传
+      globalThis.__hubHopCount = msg.hopCount
       // type: 'new_message' also goes through injectText since it's a broadcast notification
       this.injectText(msg.content || '', msg.from, msg.replyMode)
     } else if (msg.type === 'command') {
+      globalThis.__hubHopCount = msg.hopCount
       this.injectCommand(msg.content || '', msg.from)
     }
   }
@@ -178,13 +182,13 @@ export class HubClient {
   }
 
   // 发送文本消息
-  sendMessage(to: string, content: string): void {
-    this.send({ type: 'message', to, content })
+  sendMessage(to: string, content: string, hopCount?: number): void {
+    this.send({ type: 'message', to, content, hopCount })
   }
 
   // 发送 slash 命令
-  sendCommand(to: string, content: string): void {
-    this.send({ type: 'command', to, content })
+  sendCommand(to: string, content: string, hopCount?: number): void {
+    this.send({ type: 'command', to, content, hopCount })
   }
 
   disconnect(): void {
